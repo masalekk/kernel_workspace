@@ -19,32 +19,6 @@ jobs:
           git -C KernelSU log -1 --oneline
           ls -la drivers/kernelsu/ | head
 
-      - name: Inspect KernelSU Source
-        run: |
-          echo "===== KernelSU directory ====="
-          ls -la KernelSU || true
-          ls -la KernelSU/kernel || true
-
-          echo ""
-          echo "===== KernelSU git info ====="
-          cd KernelSU
-          git remote -v || true
-          git log -1 --oneline || true
-          git status --short || true
-          cd ..
-
-          echo ""
-          echo "===== KernelSU kernel files ====="
-          find KernelSU/kernel -maxdepth 2 -type f | sort | head -100
-
-          echo ""
-          echo "===== KernelSU Kconfig ====="
-          sed -n '1,240p' KernelSU/kernel/Kconfig 2>/dev/null || true
-
-          echo ""
-          echo "===== KernelSU Makefile ====="
-          sed -n '1,200p' KernelSU/kernel/Makefile 2>/dev/null || true
-          
       - name: Ubah Default Shell ke Bash
         run: |
           sudo ln -sf /bin/bash /bin/sh
