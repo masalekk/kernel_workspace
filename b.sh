@@ -69,6 +69,19 @@ export PATH="$TOOLCHAIN_DIR/clang-r383902b/bin:$TOOLCHAIN_DIR/gcc-14.3/bin:$PATH
 export CROSS_COMPILE="$TOOLCHAIN_DIR/gcc-14.3/bin/aarch64-none-linux-gnu-"
 export CROSS_COMPILE_ARM32="$TOOLCHAIN_DIR/gcc-14.3/bin/arm-none-linux-gnueabihf-"
 
+
+echo "[+] Mengaktifkan BakaSU manual hook..."
+scripts/config --file "$KERNEL_ROOT/out/.config" \
+    -e KSU \
+    -d KSU_TRACEPOINT_HOOK \
+    -e KSU_MANUAL_HOOK \
+    -e KALLSYMS_ALL
+
+make -C $KERNEL_ROOT O=$KERNEL_ROOT/out ARCH=$ARCH CC=$CC LD=ld.lld olddefconfig
+
+echo "[+] Config KSU aktif:"
+grep -E "CONFIG_KSU|CONFIG_KALLSYMS_ALL" "$KERNEL_ROOT/out/.config"
+
 # ==========================================
 # TAHAP 4: Konfigurasi & Build Kernel
 # ==========================================
