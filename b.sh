@@ -28,7 +28,7 @@ echo "[+] Cek symlink drivers/kernelsu:"
 ls -la "$KERNEL_ROOT/drivers/" | grep -i kernelsu || echo "[!] drivers/kernelsu TIDAK ADA"
 echo "[+] Opsi KSU di Kconfig ReSukiSU:"
 grep -n "^config \|^	bool\|default" "$KERNEL_ROOT/KernelSU/kernel/Kconfig" | head -60 || true
-
+python3 "$KERNEL_ROOT/ksu_hooks.py" "$KERNEL_ROOT"
 # ==========================================
 # TAHAP 2: Extract Kernel Component
 # ==========================================
