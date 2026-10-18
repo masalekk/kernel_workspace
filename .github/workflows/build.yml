@@ -1,269 +1,109 @@
-name: Build Kernel
+name: Build Kernel Otomatis
 
 on:
   workflow_dispatch:
-    inputs:
-      defconfig:
-        description: 'Kernel defconfig name'
-        required: true
-        default: 'a3core_eur_open_defconfig'
-      filesystem:
-        description: 'Filesystem support variant'
-        required: true
-        type: choice
-        options:
-          - EROFS
-          - EXT4
-        default: EROFS
-      rootSolution:
-        description: 'Kernel root implementation'
-        required: true
-        type: choice
-        options:
-          - KernelSU-Next
-          - ReSukiSU
-        default: ReSukiSU
-      disableCm4Watchdog:
-        description: 'Disable PM_SYS/CM4 watchdog for reboot debugging'
-        required: true
-        type: boolean
-        default: false
-      isPermissive:
-        description: 'Force permissive SELinux kernel'
-        required: true
-        type: boolean
-        default: false
-      isFlashableZip:
-        description: 'Generate AnyKernel3 flashable zip'
-        required: true
-        type: boolean
-        default: true
 
 jobs:
-  build:
+  kernel-compile:
     runs-on: ubuntu-22.04
-    env:
-      ARCH: arm64
-      KERNEL_ROOT: ${{ github.workspace }}
-      CROSS_COMPILE: "${{ github.workspace }}/toolchains/gcc-14.3/bin/aarch64-none-linux-gnu-"
-      CROSS_COMPILE_ARM32: "${{ github.workspace }}/toolchains/gcc-14.3/bin/arm-none-linux-gnueabihf-"
-      CC: clang
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Source Kernel
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: true
 
-      - name: Resolve build options
-        shell: bash
+      - name: Swap KernelSU -> ReSukiSU
         run: |
-          ROOT_SOLUTION="${{ inputs.rootSolution }}"
-          FILESYSTEM="${{ inputs.filesystem }}"
-          DEFCONFIG="${{ inputs.defconfig }}"
+          ls -la drivers/ | grep -i kernelsu || true
+          rm -rf KernelSU
+          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+          git -C KernelSU log -1 --oneline
+          ls -la drivers/kernelsu/ | head
 
-          echo "ROOT_SOLUTION=$ROOT_SOLUTION" >> "$GITHUB_ENV"
-          echo "FILESYSTEM=$FILESYSTEM" >> "$GITHUB_ENV"
-          echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
-          echo "Root solution: $ROOT_SOLUTION"
-          echo "Filesystem: $FILESYSTEM"
-          echo "Defconfig: $DEFCONFIG"
+      - name: Inspect KernelSU Source
+        run: |
+          echo "===== KernelSU directory ====="
+          ls -la KernelSU || true
+          ls -la KernelSU/kernel || true
 
-      - name: Install dependencies
+          echo ""
+          echo "===== KernelSU git info ====="
+          cd KernelSU
+          git remote -v || true
+          git log -1 --oneline || true
+          git status --short || true
+          cd ..
+
+          echo ""
+          echo "===== KernelSU kernel files ====="
+          find KernelSU/kernel -maxdepth 2 -type f | sort | head -100
+
+          echo ""
+          echo "===== KernelSU Kconfig ====="
+          sed -n '1,240p' KernelSU/kernel/Kconfig 2>/dev/null || true
+
+          echo ""
+          echo "===== KernelSU Makefile ====="
+          sed -n '1,200p' KernelSU/kernel/Makefile 2>/dev/null || true
+          
+      - name: Ubah Default Shell ke Bash
+        run: |
+          sudo ln -sf /bin/bash /bin/sh
+
+      # ================================
+      # CACHE TOOLCHAIN
+      # ================================
+      - name: Cache Toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/toolchain_download
+          key: toolchain-ubuntu22-clang-r383902b-gcc-14.3-v1
+          restore-keys: |
+            toolchain-ubuntu22-
+
+      # ================================
+      # CACHE APT
+      # ================================
+      - name: Cache APT
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/apt/archives
+          key: apt-ubuntu-22.04-v1
+          restore-keys: |
+            apt-ubuntu-22.04-
+
+      - name: Install Dependencies Sistem
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            make gcc g++ python3 bc libncurses-dev flex bison ccache \
-            libssl-dev libelf-dev libyaml-dev wget tar xz-utils zip unzip
+            build-essential \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            ccache \
+            python3-minimal \
+            python2 \
+            git \
+            zip \
+            unzip \
+            curl \
+            wget \
+            cpio \
+            gcc-aarch64-linux-gnu \
+            libncurses-dev \
+            libyaml-dev \
+            tar
 
-      - name: Setup GCC 14.3 & Clang
+      - name: Eksekusi Kompilasi Kernel
         run: |
-          mkdir -p toolchains/gcc-14.3 toolchains/clang-r383902b
+          chmod +x b.sh
+          ./b.sh
 
-          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/0e9e7035bf8ad42437c6156e5950eab13655b26c/clang-r383902b.tar.gz -O clang.tar.gz
-          tar -xf clang.tar.gz -C toolchains/clang-r383902b
-          rm clang.tar.gz
-
-          wget -q https://developer.arm.com/-/media/Files/downloads/gnu/14.3.rel1/binrel/arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-linux-gnu.tar.xz -O gcc.tar.xz
-          tar -xf gcc.tar.xz -C toolchains/gcc-14.3 --strip-components=1
-          rm gcc.tar.xz
-
-          echo "${{ github.workspace }}/toolchains/clang-r383902b/bin" >> "$GITHUB_PATH"
-          echo "${{ github.workspace }}/toolchains/gcc-14.3/bin" >> "$GITHUB_PATH"
-
-      - name: Integrate selected KernelSU implementation
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          # Replace the embedded KernelSU snapshot only for this build.
-          # Device-specific manual hooks in the kernel tree are preserved.
-          rm -rf KernelSU KernelSU-Next
-          rm -f drivers/kernelsu
-
-          case "$ROOT_SOLUTION" in
-            KernelSU-Next)
-              # Linux 4.14 is legacy/non-GKI, so use the legacy branch.
-              curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
-              ;;
-            ReSukiSU)
-              curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
-              ;;
-            *)
-              echo "Unsupported root solution: $ROOT_SOLUTION" >&2
-              exit 2
-              ;;
-          esac
-
-          readlink -f drivers/kernelsu
-          test -f drivers/kernelsu/Kconfig
-
-      - name: Disable CM4 watchdog for diagnostic build
-        if: ${{ inputs.disableCm4Watchdog == true }}
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('drivers/watchdog/sprd_pmic_wdt.c')
-          text = path.read_text()
-
-          start = text.find('static bool sprd_pimc_wdt_en(void)')
-          end = text.find('static const struct of_device_id', start)
-          if start < 0 or end < 0:
-              raise SystemExit(f'Could not locate sprd_pimc_wdt_en() in {path}')
-
-          block = text[start:end]
-          old = '\treturn true;'
-          new = '\treturn false; /* diagnostic: disable PM_SYS/CM4 watchdog */'
-          if old not in block:
-              raise SystemExit('Expected final return true in sprd_pimc_wdt_en() not found')
-
-          block = block.replace(old, new, 1)
-          path.write_text(text[:start] + block + text[end:])
-          PY
-
-          sed -n '/static bool sprd_pimc_wdt_en/,/static const struct of_device_id/p' \
-            drivers/watchdog/sprd_pmic_wdt.c | tail -n 18
-
-      - name: Configure kernel
-        shell: bash
-        run: |
-          set -euxo pipefail
-          make -C "$KERNEL_ROOT" O="$KERNEL_ROOT/out" ARCH="$ARCH" "$DEFCONFIG"
-
-          chmod +x scripts/config
-
-          # Root solution
-          scripts/config --file out/.config -e KSU
-          scripts/config --file out/.config -e KSU_MANUAL_HOOK
-
-          if [ "$ROOT_SOLUTION" = "ReSukiSU" ]; then
-            scripts/config --file out/.config -d KSU_TRACEPOINT_HOOK || true
-            scripts/config --file out/.config -d KSU_SUSFS || true
-          else
-            scripts/config --file out/.config -d KSU_KPROBES_HOOK || true
-          fi
-
-          # Filesystem variant. EXT4 is already supported by this kernel tree;
-          # the EXT4 variant simply removes EROFS support from the final config.
-          case "$FILESYSTEM" in
-            EROFS)
-              scripts/config --file out/.config -e EROFS_FS
-              scripts/config --file out/.config -e EROFS_FS_XATTR
-              scripts/config --file out/.config -e EROFS_FS_POSIX_ACL
-              scripts/config --file out/.config -e EROFS_FS_SECURITY
-              scripts/config --file out/.config -e EROFS_FS_ZIP
-              scripts/config --file out/.config -e EROFS_FS_ARMV8_ACCELERATED_LZ4
-              scripts/config --file out/.config --set-val EROFS_FS_CLUSTER_PAGE_LIMIT 1
-              ;;
-            EXT4)
-              scripts/config --file out/.config -e EXT4_FS
-              scripts/config --file out/.config -e EXT4_FS_POSIX_ACL
-              scripts/config --file out/.config -e EXT4_FS_SECURITY
-              scripts/config --file out/.config -e EXT4_ENCRYPTION
-              scripts/config --file out/.config -e EXT4_FS_ENCRYPTION
-
-              scripts/config --file out/.config -d EROFS_FS
-              scripts/config --file out/.config -d EROFS_FS_XATTR || true
-              scripts/config --file out/.config -d EROFS_FS_POSIX_ACL || true
-              scripts/config --file out/.config -d EROFS_FS_SECURITY || true
-              scripts/config --file out/.config -d EROFS_FS_ZIP || true
-              scripts/config --file out/.config -d EROFS_FS_ARMV8_ACCELERATED_LZ4 || true
-              ;;
-            *)
-              echo "Unsupported filesystem: $FILESYSTEM" >&2
-              exit 2
-              ;;
-          esac
-
-          make -C "$KERNEL_ROOT" O="$KERNEL_ROOT/out" ARCH="$ARCH" olddefconfig
-
-          echo "===== KernelSU config ====="
-          grep -E '^CONFIG_KSU|^# CONFIG_KSU' out/.config || true
-          echo "===== Filesystem config ====="
-          grep -E '^CONFIG_(EROFS|EXT4)|^# CONFIG_(EROFS|EXT4)' out/.config || true
-
-      - name: Patch permissive
-        if: ${{ inputs.isPermissive == true }}
-        run: |
-          TARGET_BRANCH="KernelSU-permissive"
-          git fetch --depth 1 origin "$TARGET_BRANCH"
-          git checkout FETCH_HEAD -- security/selinux/hooks.c
-          git checkout FETCH_HEAD -- security/selinux/selinuxfs.c
-          echo "Permissive patch applied from $TARGET_BRANCH"
-
-      - name: Build kernel
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          export KBUILD_BUILD_HOST="$(. /etc/os-release && echo ${NAME}-${VERSION_ID})"
-          export KBUILD_BUILD_TIMESTAMP="$(date -u -R)"
-
-          # Ignore YAML dtc helpers unavailable in this old vendor tree.
-          sed -i '/yamltree.o/d' scripts/dtc/Makefile
-          sed -i '/dt_to_yaml/d' scripts/dtc/dtc.c
-
-          make -C "$KERNEL_ROOT" O="$KERNEL_ROOT/out" -j"$(nproc)" \
-            ARCH="$ARCH" CC="$CC" CROSS_COMPILE="$CROSS_COMPILE" \
-            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" Image
-
-          test -s "$KERNEL_ROOT/out/arch/arm64/boot/Image"
-          ls -lh "$KERNEL_ROOT/out/arch/arm64/boot/Image"
-
-      - name: Build AnyKernel3 Flashable Zip
-        if: ${{ inputs.isFlashableZip == true }}
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git AK3
-          cp "$KERNEL_ROOT/out/arch/arm64/boot/Image" AK3/
-
-          cd AK3
-          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
-          sed -i "s/kernel.string=.*/kernel.string=A032F-${FILESYSTEM}-${ROOT_SOLUTION} by VildanG/g" anykernel.sh
-          sed -i 's|BLOCK=.*|BLOCK=auto;|g' anykernel.sh
-          sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=0;/g' anykernel.sh
-          sed -i '/# init.rc/,/append_file fstab.tuna.*/d' anykernel.sh
-
-          zip -r9 "../A032F-${FILESYSTEM}-${ROOT_SOLUTION}.zip" . -x '.git/*' '.github/*'
-          cd ..
-          ls -lh "A032F-${FILESYSTEM}-${ROOT_SOLUTION}.zip"
-
-      - name: Upload Kernel Image
+      - name: Upload Hasil Jadi
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-image-${{ env.FILESYSTEM }}-${{ env.ROOT_SOLUTION }}
-          path: |
-            ${{ github.workspace }}/out/arch/arm64/boot/Image
-            ${{ github.workspace }}/out/.config
-          retention-days: 7
-
-      - name: Upload AnyKernel3 Zip
-        if: ${{ inputs.isFlashableZip == true }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: AnyKernel3-${{ env.FILESYSTEM }}-${{ env.ROOT_SOLUTION }}
-          path: ${{ github.workspace }}/A032F-${{ env.FILESYSTEM }}-${{ env.ROOT_SOLUTION }}.zip
-          retention-days: 7
+          name: Hasil-Kernel-Sprd
+          path: ${{ github.workspace }}/output_artifacts/*
