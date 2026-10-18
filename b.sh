@@ -1,96 +1,174 @@
 #!/bin/bash
-set -euo pipefail
+set -e
 
-# ============================================================
-# INITIALIZATION & PATHS
-# ============================================================
-
-export KERNEL_ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
+# ==========================================
+# INISIALISASI & PATH 
+# ==========================================
+export KERNEL_ROOT=$GITHUB_WORKSPACE
+export TOOLCHAIN_DIR=$KERNEL_ROOT/toolchain_download
 export ARCH=arm64
 export SUBARCH=arm64
-export DEFCONFIG="${DEFCONFIG:-a3core_eur_open_defconfig}"
-
-export TOOLCHAIN="${KERNEL_ROOT}/toolchains"
-export CLANG_BIN="${TOOLCHAIN}/clang-r383902b/bin"
-export GCC_BIN="${TOOLCHAIN}/gcc-14.3/bin"
-
-export PATH="${CLANG_BIN}:${GCC_BIN}:${PATH}"
-
 export CC=clang
-export LD=ld.lld
-export AR=llvm-ar
-export NM=llvm-nm
-export OBJCOPY=llvm-objcopy
-export OBJDUMP=llvm-objdump
-export STRIP=llvm-strip
-
-export HOSTCC=gcc
-export HOSTCXX=g++
-export HOSTLD=ld.bfd
-
-export CROSS_COMPILE="${GCC_BIN}/aarch64-none-linux-gnu-"
-export CROSS_COMPILE_ARM32="${GCC_BIN}/arm-none-linux-gnueabihf-"
 export CLANG_TRIPLE=aarch64-linux-gnu-
+export BSP_BUILD_FAMILY=sharkl3
+export BSP_BUILD_ANDROID_OS=y
+export DEFCONFIG="a3core_eur_open_defconfig"
 
-export OUT="${KERNEL_ROOT}/out"
-export ART="${KERNEL_ROOT}/output_artifacts"
+# ==========================================
+# TAHAP 1: KSU Integration
+# ==========================================
+echo "[+] Mengintegrasikan ReSukiSU..."
+cd "$KERNEL_ROOT"
 
-# ============================================================
-# PREPARE ENVIRONMENT
-# ============================================================
+rm -rf "$KERNEL_ROOT/KernelSU"
+git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git "$KERNEL_ROOT/KernelSU"
+echo "[+] ReSukiSU commit: $(git -C "$KERNEL_ROOT/KernelSU" rev-parse HEAD)"
 
-echo "[+] Membersihkan folder output..."
-rm -rf "$OUT" "$ART"
-mkdir -p "$OUT" "$ART"
+echo "[+] Cek symlink drivers/kernelsu:"
+ls -la "$KERNEL_ROOT/drivers/" | grep -i kernelsu || echo "[!] drivers/kernelsu TIDAK ADA"
+echo "[+] Opsi KSU di Kconfig ReSukiSU:"
+grep -n "^config \|^	bool\|default" "$KERNEL_ROOT/KernelSU/kernel/Kconfig" | head -60 || true
 
-# ============================================================
-# CONFIGURE DEFCONFIG
-# ============================================================
-
-echo "[+] Membuat defconfig..."
-make -C "$KERNEL_ROOT" O="$OUT" ARCH="$ARCH" SUBARCH="$SUBARCH" CC="$CC" LD="$LD" HOSTCC="$HOSTCC" HOSTCXX="$HOSTCXX" HOSTLD="$HOSTLD" "$DEFCONFIG"
-
-echo "[+] Menyiapkan script config..."
-if [ ! -x scripts/config ]; then
-    make -C "$KERNEL_ROOT" O="$OUT" ARCH="$ARCH" HOSTCC="$HOSTCC" HOSTCXX="$HOSTCXX" HOSTLD="$HOSTLD" scripts
-fi
-
-echo "[+] Injecting KernelSU Next (Manual Hook) ke Defconfig..."
-scripts/config --file "$OUT/.config" --enable KSU
-scripts/config --file "$OUT/.config" --enable KSU_MANUAL_HOOK
-scripts/config --file "$OUT/.config" --disable KPROBES
-scripts/config --file "$OUT/.config" --disable KPROBE_EVENTS
-scripts/config --file "$OUT/.config" --disable KSU_TRACEPOINT_HOOK || true
-scripts/config --file "$OUT/.config" --disable KSU_SUSFS || true
-scripts/config --file "$OUT/.config" --enable OVERLAY_FS
-make -C "$KERNEL_ROOT" O="$OUT" ARCH="$ARCH" SUBARCH="$SUBARCH" CC="$CC" LD="$LD" HOSTCC="$HOSTCC" HOSTCXX="$HOSTCXX" HOSTLD="$HOSTLD" olddefconfig
-
-# ============================================================
-# PATCH & BUILD
-# ============================================================
-
-echo "[+] Patch DTC Compatibility..."
-sed -i '/yamltree\.o/d' scripts/dtc/Makefile || true
-sed -i '/dt_to_yaml/d' scripts/dtc/dtc.c || true
-
-export KBUILD_BUILD_USER="KernelSU-Next"
-export KBUILD_BUILD_HOST="GitHub-Actions"
-
-echo "[+] Memulai Kompilasi Image Kernel..."
-make -C "$KERNEL_ROOT" O="$OUT" -j"$(nproc)" ARCH="$ARCH" SUBARCH="$SUBARCH" CC="$CC" LD="$LD" AR="$AR" NM="$NM" OBJCOPY="$OBJCOPY" OBJDUMP="$OBJDUMP" STRIP="$STRIP" HOSTCC="$HOSTCC" HOSTCXX="$HOSTCXX" HOSTLD="$HOSTLD" CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" CLANG_TRIPLE="$CLANG_TRIPLE" Image
-
-# ============================================================
-# COLLECT ARTIFACTS
-# ============================================================
-
-echo "[+] Mengumpulkan Hasil Build..."
-if [ -s "$OUT/arch/arm64/boot/Image" ]; then
-    cp "$OUT/arch/arm64/boot/Image" "$ART/Image"
-    cp "$OUT/.config" "$ART/kernel.config"
-    make -C "$KERNEL_ROOT" O="$OUT" ARCH="$ARCH" CC="$CC" LD="$LD" HOSTCC="$HOSTCC" HOSTCXX="$HOSTCXX" HOSTLD="$HOSTLD" kernelrelease > "$ART/kernel.release"
-    
-    echo "[OK] Build Sukses! File Image ditemukan."
+# ==========================================
+# TAHAP 2: Extract Kernel Component
+# ==========================================
+echo "[+] Mengekstrak komponen sound/soc/sprd..."
+mkdir -p $KERNEL_ROOT/output
+if [ -d "$KERNEL_ROOT/sound/soc/sprd" ]; then
+  cp -r $KERNEL_ROOT/sound/soc/sprd $KERNEL_ROOT/output/
+  cd $KERNEL_ROOT/output
+  zip -r sprd.zip sprd
+  cd $KERNEL_ROOT
 else
-    echo "[ERROR] Image kernel gagal di-build!"
-    exit 1
+  echo "[!] Direktori sound/soc/sprd tidak ditemukan, melewati tahap ini."
 fi
+
+# ==========================================
+# TAHAP 3: Setup Toolchains dari Skrip
+# ==========================================
+mkdir -p $TOOLCHAIN_DIR/gcc-14.3 $TOOLCHAIN_DIR/clang-r383902b
+
+if [ ! -f "$TOOLCHAIN_DIR/clang-r383902b/bin/clang" ]; then
+  echo "[+] Downloading Clang ke toolchain directory..."
+  wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/0e9e7035bf8ad42437c6156e5950eab13655b26c/clang-r383902b.tar.gz -O /tmp/clang.tar.gz
+  tar -xf /tmp/clang.tar.gz -C $TOOLCHAIN_DIR/clang-r383902b && rm /tmp/clang.tar.gz
+else
+  echo "[=] Clang sudah terunduh, melewatinya."
+fi
+
+if [ ! -f "$TOOLCHAIN_DIR/gcc-14.3/bin/aarch64-none-linux-gnu-gcc" ]; then
+  echo "[+] Downloading GCC 14.3 ke toolchain directory..."
+  wget -q https://developer.arm.com/-/media/Files/downloads/gnu/14.3.rel1/binrel/arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-linux-gnu.tar.xz -O /tmp/gcc.tar.xz
+  tar -xf /tmp/gcc.tar.xz -C $TOOLCHAIN_DIR/gcc-14.3 --strip-components=1 && rm /tmp/gcc.tar.xz
+else
+  echo "[=] GCC 14.3 sudah terunduh, melewatinya."
+fi
+
+# Mengatur PATH secara presisi ke bin toolchain baru
+export PATH="$TOOLCHAIN_DIR/clang-r383902b/bin:$TOOLCHAIN_DIR/gcc-14.3/bin:$PATH"
+export CROSS_COMPILE="$TOOLCHAIN_DIR/gcc-14.3/bin/aarch64-none-linux-gnu-"
+export CROSS_COMPILE_ARM32="$TOOLCHAIN_DIR/gcc-14.3/bin/arm-none-linux-gnueabihf-"
+
+# ==========================================
+# TAHAP 4: Konfigurasi & Build Kernel
+# ==========================================
+echo "[+] Melakukan konfigurasi kernel dengan $DEFCONFIG..."
+make -C $KERNEL_ROOT O=$KERNEL_ROOT/out ARCH=$ARCH CC=$CC LD=ld.lld $DEFCONFIG
+echo "[+] Config KSU aktif:"
+grep -i "CONFIG_KSU" "$KERNEL_ROOT/out/.config" || echo "[!] CONFIG_KSU tidak ada di .config"
+
+echo "[+] Memulai kompilasi Kernel Image..."
+export KBUILD_BUILD_USER="Xsanzz"
+export KBUILD_BUILD_HOST="A03Core"
+export KBUILD_BUILD_TIMESTAMP="$(date '+%a %b %d %T WIB %Y')"
+
+# Tambahan Flags Optimasi CPU (Cortex-A55) & Linker
+export KCFLAGS="-march=armv8.2-a+crypto -mtune=cortex-a55 -fno-semantic-interposition"
+export KBUILD_LDFLAGS="--gc-sections --icf=all"
+
+# Ignore yaml
+sed -i '/yamltree.o/d' scripts/dtc/Makefile
+sed -i '/dt_to_yaml/d' scripts/dtc/dtc.c
+
+# Eksekusi Build Image
+make -C $KERNEL_ROOT O=$KERNEL_ROOT/out -j$(nproc) ARCH=$ARCH \
+    CC=$CC \
+    CROSS_COMPILE=$CROSS_COMPILE \
+    CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
+    CLANG_TRIPLE=$CLANG_TRIPLE \
+    LD=ld.lld \
+    AR=llvm-ar \
+    NM=llvm-nm \
+    KCFLAGS="$KCFLAGS" \
+    KBUILD_LDFLAGS="$KBUILD_LDFLAGS" \
+    Image
+
+# ==========================================
+# BUILD KERNEL MODULES
+# ==========================================
+echo "[+] Memulai kompilasi kernel modules (.ko)..."
+
+make -C $KERNEL_ROOT O=$KERNEL_ROOT/out -j$(nproc) ARCH=$ARCH \
+    CC=$CC \
+    CROSS_COMPILE=$CROSS_COMPILE \
+    CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
+    CLANG_TRIPLE=$CLANG_TRIPLE \
+    LD=ld.lld \
+    AR=llvm-ar \
+    NM=llvm-nm \
+    KCFLAGS="$KCFLAGS" \
+    KBUILD_LDFLAGS="$KBUILD_LDFLAGS" \
+    modules
+
+echo "[+] Jumlah .ko yang dihasilkan:"
+find "$KERNEL_ROOT/out" -type f -name "*.ko" | wc -l
+    
+# ==========================================
+# ARTIFACTS: Pengumpulan Hasil Jadi
+# ==========================================
+echo "[+] Mengumpulkan hasil eksport..."
+mkdir -p "$GITHUB_WORKSPACE/output_artifacts"
+
+OUT="$KERNEL_ROOT/out"
+ART="$GITHUB_WORKSPACE/output_artifacts"
+
+# Kernel utama
+if [ -f "$OUT/arch/arm64/boot/Image" ]; then
+    cp "$OUT/arch/arm64/boot/Image" "$ART/"
+    echo "[+] Image"
+fi
+
+# Kernel config
+if [ -f "$OUT/.config" ]; then
+    cp "$OUT/.config" "$ART/kernel.config"
+    echo "[+] .config"
+fi
+
+# System.map
+if [ -f "$OUT/System.map" ]; then
+    cp "$OUT/System.map" "$ART/"
+    echo "[+] System.map"
+fi
+
+# Module symbol table
+if [ -f "$OUT/Module.symvers" ]; then
+    cp "$OUT/Module.symvers" "$ART/"
+    echo "[+] Module.symvers"
+fi
+
+MODULE_DIR="$ART/modules"
+mkdir -p "$MODULE_DIR"
+
+find "$OUT" -type f -name "*.ko" | while read -r ko; do
+    rel="${ko#$OUT/}"
+    mkdir -p "$MODULE_DIR/$(dirname "$rel")"
+    cp -v "$ko" "$MODULE_DIR/$rel"
+done
+
+echo ""
+echo "[+] Daftar module:"
+find "$MODULE_DIR" -type f -name "*.ko" -exec du -h {} \;
+
+echo ""
+echo "[+] Daftar artifact:"
+find "$ART" -type f -exec du -h {} \;
