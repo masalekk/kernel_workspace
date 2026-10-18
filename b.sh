@@ -81,7 +81,7 @@ scripts/config --file "$KERNEL_ROOT/out/.config" \
     -e KSU_MANUAL_HOOK \
     -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
     -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
-    -d KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+    -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
     -e KALLSYMS_ALL
 
 make -C $KERNEL_ROOT O=$KERNEL_ROOT/out ARCH=$ARCH CC=$CC LD=ld.lld olddefconfig
