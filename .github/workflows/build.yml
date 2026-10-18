@@ -11,7 +11,7 @@ jobs:
       - name: Checkout Source Kernel
         uses: actions/checkout@v4
 
-      - name: Swap KernelSU -> ReSukiSU
+      - name: Swap KernelSU -> BakaSU
         run: |
           ls -la drivers/ | grep -i kernelsu || true
           rm -rf KernelSU
