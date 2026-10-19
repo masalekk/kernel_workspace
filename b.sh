@@ -2,7 +2,7 @@
 set -e
 
 # ==========================================
-# INISIALISASI & PATH 
+# INISIALISASI & PATH
 # ==========================================
 export KERNEL_ROOT=$GITHUB_WORKSPACE
 export TOOLCHAIN_DIR=$KERNEL_ROOT/toolchain_download
@@ -14,24 +14,70 @@ export BSP_BUILD_FAMILY=sharkl3
 export BSP_BUILD_ANDROID_OS=y
 export DEFCONFIG="a3core_eur_open_defconfig"
 
+# ---- Opsi SuSFS ----
+ENABLE_SUSFS=1                                   # 0 = build tanpa SuSFS (versi yang sudah terbukti jalan)
+SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
+SUSFS_BRANCH="kernel-4.14"
+
 # ==========================================
 # TAHAP 1: KSU Integration
 # ==========================================
-echo "[+] Mengintegrasikan ReSukiSU..."
+echo "[+] Mengintegrasikan ReSukiSU/BakaSU..."
 cd "$KERNEL_ROOT"
 
 rm -rf "$KERNEL_ROOT/KernelSU"
 git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git "$KERNEL_ROOT/KernelSU"
-echo "[+] ReSukiSU commit: $(git -C "$KERNEL_ROOT/KernelSU" rev-parse HEAD)"
+echo "[+] KSU commit: $(git -C "$KERNEL_ROOT/KernelSU" rev-parse HEAD)"
 
 echo "[+] Cek symlink drivers/kernelsu:"
 ls -la "$KERNEL_ROOT/drivers/" | grep -i kernelsu || echo "[!] drivers/kernelsu TIDAK ADA"
-echo "[+] Opsi KSU di Kconfig ReSukiSU:"
+echo "[+] Opsi KSU di Kconfig:"
 grep -n "^config \|^	bool\|default" "$KERNEL_ROOT/KernelSU/kernel/Kconfig" | head -60 || true
+
+# ==========================================
+# TAHAP 1b: SuSFS (patch sisi kernel)
+# ==========================================
+if [ "$ENABLE_SUSFS" = "1" ]; then
+    echo "[+] Integrasi SuSFS ($SUSFS_BRANCH)..."
+    rm -rf /tmp/susfs
+    git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" /tmp/susfs
+    PATCH=/tmp/susfs/kernel_patches/50_add_susfs_in_kernel-4.14.patch
+    if [ ! -f "$PATCH" ]; then
+        echo "[!] Patch tidak ditemukan: $PATCH"
+        ls /tmp/susfs/kernel_patches || true
+        exit 1
+    fi
+
+    cd "$KERNEL_ROOT"
+
+    # Salin susfs.c/susfs.h HANYA kalau patch tidak membuat file itu sendiri
+    if ! grep -q '^+++ b/fs/susfs.c' "$PATCH"; then
+        cp /tmp/susfs/kernel_patches/fs/susfs*.c fs/ 2>/dev/null || true
+        cp /tmp/susfs/kernel_patches/include/linux/susfs*.h include/linux/ 2>/dev/null || true
+    fi
+
+    echo "[+] Dry-run patch SuSFS..."
+    patch -p1 --dry-run < "$PATCH" || true
+
+    echo "[+] Apply patch SuSFS..."
+    patch -p1 < "$PATCH" || echo "[!] Ada hunk gagal, lihat .rej di bawah"
+
+    find . -name '*.rej' -not -path './out/*' > /tmp/rej.list
+    if [ -s /tmp/rej.list ]; then
+        echo "[!] HUNK GAGAL. Build dihentikan biar tidak buang waktu."
+        cat /tmp/rej.list
+        while read -r r; do echo "----- $r -----"; cat "$r"; done < /tmp/rej.list
+        exit 1
+    fi
+
+    echo "[+] Versi SuSFS di kernel:"
+    grep -rn "SUSFS_VERSION" include/linux/susfs*.h 2>/dev/null | head -5 || true
+fi
 
 # ==========================================
 # TAHAP 2: Extract Kernel Component
 # ==========================================
+cd "$KERNEL_ROOT"
 echo "[+] Mengekstrak komponen sound/soc/sprd..."
 mkdir -p $KERNEL_ROOT/output
 if [ -d "$KERNEL_ROOT/sound/soc/sprd" ]; then
@@ -72,10 +118,14 @@ export CROSS_COMPILE_ARM32="$TOOLCHAIN_DIR/gcc-14.3/bin/arm-none-linux-gnueabihf
 # ==========================================
 # TAHAP 4: Konfigurasi & Build Kernel
 # ==========================================
+cd "$KERNEL_ROOT"
+CFG="$KERNEL_ROOT/out/.config"
+
 echo "[+] Melakukan konfigurasi kernel dengan $DEFCONFIG..."
 make -C $KERNEL_ROOT O=$KERNEL_ROOT/out ARCH=$ARCH CC=$CC LD=ld.lld $DEFCONFIG
+
 echo "[+] Mengaktifkan BakaSU manual hook..."
-scripts/config --file "$KERNEL_ROOT/out/.config" \
+scripts/config --file "$CFG" \
     -e KSU \
     -d KSU_TRACEPOINT_HOOK \
     -e KSU_MANUAL_HOOK \
@@ -84,9 +134,59 @@ scripts/config --file "$KERNEL_ROOT/out/.config" \
     -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
     -e KALLSYMS_ALL
 
+if [ "$ENABLE_SUSFS" = "1" ]; then
+    echo "[+] Mengaktifkan SuSFS (fitur inti saja)..."
+    # AKTIF  : SUS_PATH (sembunyikan path), SUS_MOUNT (sembunyikan mount), TRY_UMOUNT (umount module utk app tertentu)
+    # NONAKTIF sengaja: SUS_SU (tidak didukung non-GKI), ENABLE_LOG, OPEN_REDIRECT, SUS_MAP, SUS_KSTAT, SPOOF_*
+    #                   dan apa pun yang berbau mnt_id reorder (bikin bootloop di non-GKI)
+    scripts/config --file "$CFG" \
+        -e KSU_SUSFS \
+        -e KSU_SUSFS_SUS_PATH \
+        -e KSU_SUSFS_SUS_MOUNT \
+        -e KSU_SUSFS_TRY_UMOUNT \
+        -d KSU_SUSFS_SUS_SU \
+        -d KSU_SUSFS_ENABLE_LOG \
+        -d KSU_SUSFS_OPEN_REDIRECT \
+        -d KSU_SUSFS_SUS_MAP \
+        -d KSU_SUSFS_SUS_KSTAT \
+        -d KSU_SUSFS_SPOOF_UNAME \
+        -d KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+fi
+
 make -C $KERNEL_ROOT O=$KERNEL_ROOT/out ARCH=$ARCH CC=$CC LD=ld.lld olddefconfig
+
+# Pengaman bootloop: kalau ada opsi *REORDER* aktif, matikan
+for sym in $(grep -E "^CONFIG_KSU_SUSFS.*REORDER.*=y" "$CFG" 2>/dev/null | sed -E 's/^CONFIG_([A-Za-z0-9_]+)=y/\1/'); do
+    echo "[!] Mematikan opsi berisiko bootloop: $sym"
+    scripts/config --file "$CFG" -d "$sym"
+done
+make -C $KERNEL_ROOT O=$KERNEL_ROOT/out ARCH=$ARCH CC=$CC LD=ld.lld olddefconfig
+
 echo "[+] Config KSU aktif:"
-grep -i "CONFIG_KSU" "$KERNEL_ROOT/out/.config" || echo "[!] CONFIG_KSU tidak ada di .config"
+grep -i "CONFIG_KSU" "$CFG" || echo "[!] CONFIG_KSU tidak ada di .config"
+
+if [ "$ENABLE_SUSFS" = "1" ]; then
+    echo "[+] Verifikasi SuSFS..."
+    if ! grep -q '^CONFIG_KSU_SUSFS=y' "$CFG"; then
+        echo "[!] CONFIG_KSU_SUSFS TIDAK AKTIF setelah olddefconfig."
+        echo "    Kemungkinan: bentrok dengan KSU_MANUAL_HOOK atau simbol tidak ada di Kconfig BakaSU."
+        echo "===== Kconfig BakaSU: SUSFS & hook mode ====="
+        grep -n -B2 -A14 "config KSU_SUSFS\b\|config KSU_MANUAL_HOOK\|^choice\|^endchoice" \
+            "$KERNEL_ROOT/KernelSU/kernel/Kconfig" | head -200 || true
+        echo "===== SuSFS di .config ====="
+        grep -n "KSU_SUSFS\|KSU_MANUAL_HOOK" "$CFG" || echo "(tidak ada)"
+        exit 1
+    fi
+    for s in KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_TRY_UMOUNT; do
+        grep -q "^CONFIG_${s}=y" "$CFG" && echo "    [ok] $s" || echo "    [--] $s tidak aktif (simbol mungkin beda nama/versi)"
+    done
+    if grep -q '^CONFIG_KSU_SUSFS_SUS_SU=y' "$CFG"; then
+        echo "[!] SUS_SU aktif, tidak didukung non-GKI. Hentikan."
+        exit 1
+    fi
+    echo "[+] Semua opsi SuSFS di .config:"
+    grep -n "KSU_SUSFS" "$CFG" || true
+fi
 
 echo "[+] Memulai kompilasi Kernel Image..."
 export KBUILD_BUILD_USER="masalek"
@@ -133,7 +233,7 @@ make -C $KERNEL_ROOT O=$KERNEL_ROOT/out -j$(nproc) ARCH=$ARCH \
 
 echo "[+] Jumlah .ko yang dihasilkan:"
 find "$KERNEL_ROOT/out" -type f -name "*.ko" | wc -l
-    
+
 # ==========================================
 # ARTIFACTS: Pengumpulan Hasil Jadi
 # ==========================================
