@@ -18,6 +18,7 @@ export DEFCONFIG="a3core_eur_open_defconfig"
 ENABLE_SUSFS=1                                   # 0 = build tanpa SuSFS
 SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
 SUSFS_BRANCH="kernel-4.14"
+SUSFS_SUS_MOUNT=0                                # 0 = aman buat boot pertama. Set 1 SETELAH kernel terbukti boot
 LOCALVERSION_BASE="-Perf-v2s-BakaSU"             # nama kernel (uname -r), -SUSFS dan -@masalek ditambah otomatis
 
 # ==========================================
@@ -61,7 +62,257 @@ if [ "$ENABLE_SUSFS" = "1" ]; then
     patch -p1 --dry-run < "$PATCH" || true
 
     echo "[+] Apply patch SuSFS..."
-    patch -p1 < "$PATCH" || echo "[!] Ada hunk gagal, lihat .rej di bawah"
+    patch -p1 --no-backup-if-mismatch < "$PATCH" || echo "[!] Ada hunk gagal, mencoba perbaikan otomatis..."
+
+    echo "[+] Memperbaiki hunk yang gagal (include/hook yang beda di source Samsung)..."
+    python3 - <<'PYEOF' || true
+import os, re, sys
+
+root = os.environ["KERNEL_ROOT"]
+log, bad = [], []
+
+
+def rd(p):
+    with open(os.path.join(root, p), encoding="utf-8", errors="surrogateescape") as f:
+        return f.read()
+
+
+def wr(p, s):
+    with open(os.path.join(root, p), "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write(s)
+
+
+def rm_rej(p):
+    f = os.path.join(root, p + ".rej")
+    if os.path.exists(f):
+        os.remove(f)
+
+
+def ok(p, m):
+    log.append("[OK]    %-24s %s" % (p, m))
+
+
+def skip(p, m):
+    log.append("[SKIP]  %-24s %s" % (p, m))
+
+
+def fail(p, m):
+    bad.append(p)
+    log.append("[GAGAL] %-24s %s" % (p, m))
+
+
+def func_span(src, header_re):
+    m = re.search(header_re, src, re.M)
+    if not m:
+        return None
+    op = src.find("{", m.end())
+    if op < 0:
+        return None
+    depth = 0
+    for i in range(op, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return m.start(), op, i
+    return None
+
+
+# ---------------------------------------------------------------- namei.c
+def fix_namei():
+    p = "fs/namei.c"
+    s = rd(p)
+    if "susfs_def.h" in s:
+        rm_rej(p)
+        return skip(p, "include sudah ada")
+    m = re.search(r'^#include "internal.h"\n', s, re.M)
+    if not m:
+        return fail(p, '#include "internal.h" tidak ketemu')
+    blk = ("#if defined(CONFIG_KSU_SUSFS_SUS_PATH) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n"
+           "#include <linux/susfs_def.h>\n#endif\n\n")
+    wr(p, s[:m.start()] + blk + s[m.start():])
+    rm_rej(p)
+    ok(p, "include susfs_def.h ditambah")
+
+
+# ------------------------------------------------------------- task_mmu.c
+def fix_task_mmu():
+    p = "fs/proc/task_mmu.c"
+    s = rd(p)
+    if "susfs_def.h" in s:
+        rm_rej(p)
+        return skip(p, "include sudah ada")
+    m = re.search(r'^#include <asm/elf.h>\n', s, re.M)
+    if not m:
+        return fail(p, "#include <asm/elf.h> tidak ketemu")
+    blk = ("#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n\n")
+    wr(p, s[:m.start()] + blk + s[m.start():])
+    rm_rej(p)
+    ok(p, "include susfs_def.h ditambah")
+
+
+# ------------------------------------------------------------- cmdline.c
+def fix_cmdline():
+    p = "fs/proc/cmdline.c"
+    s = rd(p)
+    if "susfs_spoof_cmdline_or_bootconfig" in s:
+        rm_rej(p)
+        return skip(p, "sudah ada")
+    m1 = re.search(r'^static int cmdline_proc_show\(', s, re.M)
+    m2 = re.search(r'^[ \t]*seq_printf\(m, "%s\\n", saved_command_line\);', s, re.M)
+    if not (m1 and m2):
+        rm_rej(p)  # fitur spoof cmdline dimatikan, aman dilewati
+        return skip(p, "pola beda, dilewati (SPOOF_CMDLINE dimatikan)")
+    body = ("#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n"
+            "\tif (!susfs_spoof_cmdline_or_bootconfig(m)) {\n"
+            "\t\tseq_putc(m, '\\n');\n\t\treturn 0;\n\t}\n#endif\n")
+    decl = ("#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n"
+            "extern int susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);\n#endif\n\n")
+    s = s[:m2.start()] + body + s[m2.start():]
+    s = s[:m1.start()] + decl + s[m1.start():]
+    wr(p, s)
+    rm_rej(p)
+    ok(p, "hook spoof cmdline dipasang")
+
+
+# --------------------------------------------------------------- readdir.c
+def fix_readdir():
+    p = "fs/readdir.c"
+    s = rd(p)
+    span = func_span(s, r'^static int compat_fillonedir\(')
+    if not span:
+        return fail(p, "compat_fillonedir tidak ketemu")
+    st, op, cl = span
+    body = s[op:cl + 1]
+    if "susfs_sus_ino_for_filldir64" in body:
+        rm_rej(p)
+        return skip(p, "hook sudah ada di compat_fillonedir")
+    m = re.search(r'if \(buf->result\)\s*\n\s*return -EINVAL;[ \t]*\n', body)
+    if not m:
+        return fail(p, "pola 'if (buf->result) return -EINVAL;' tidak ketemu di compat_fillonedir")
+    blk = ("#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n"
+           "\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) && susfs_sus_ino_for_filldir64(ino)) {\n"
+           "\t\treturn 0;\n\t}\n#endif\n")
+    body = body[:m.end()] + blk + body[m.end():]
+    wr(p, s[:op] + body + s[cl + 1:])
+    rm_rej(p)
+    ok(p, "hook SUS_PATH dipasang di compat_fillonedir")
+
+
+# ------------------------------------------------------------- namespace.c
+NS_TOP_INC = ("#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)\n"
+              "#include <linux/susfs_def.h>\n#endif\n\n")
+NS_TOP_DECL = """
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+extern bool susfs_is_current_ksu_domain(void);
+extern bool susfs_is_current_zygote_domain(void);
+
+static DEFINE_IDA(susfs_mnt_id_ida);
+static DEFINE_IDA(susfs_mnt_group_ida);
+static int susfs_mnt_id_start = DEFAULT_SUS_MNT_ID;
+static int susfs_mnt_group_start = DEFAULT_SUS_MNT_GROUP_ID;
+
+#define CL_ZYGOTE_COPY_MNT_NS BIT(24) /* used by copy_mnt_ns() */
+#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
+#endif
+
+#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+extern void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname);
+bool susfs_is_auto_add_sus_ksu_default_mount_enabled = true;
+#endif
+#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+extern int susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target);
+bool susfs_is_auto_add_sus_bind_mount_enabled = true;
+#endif
+#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+extern void susfs_auto_add_try_umount_for_bind_mount(struct path *path);
+bool susfs_is_auto_add_try_umount_for_bind_mount_enabled = true;
+#endif
+"""
+NS_BOTTOM_UMOUNT = """
+#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+extern void susfs_try_umount_all(uid_t uid);
+void susfs_run_try_umount_for_current_mnt_ns(void) {
+	struct mount *mnt;
+	struct mnt_namespace *mnt_ns;
+
+	mnt_ns = current->nsproxy->mnt_ns;
+	// Lock the namespace
+	namespace_lock();
+	list_for_each_entry(mnt, &mnt_ns->list, mnt_list) {
+		// Change the sus mount to be private
+		if (mnt->mnt_id >= DEFAULT_SUS_MNT_ID) {
+			change_mnt_propagation(mnt, MS_PRIVATE);
+		}
+	}
+	// Unlock the namespace
+	namespace_unlock();
+	susfs_try_umount_all(current_uid().val);
+}
+#endif
+"""
+NS_BOTTOM_DEVNAME = """#ifdef CONFIG_KSU_SUSFS
+bool susfs_is_mnt_devname_ksu(struct path *path) {
+	struct mount *mnt;
+
+	if (path && path->mnt) {
+		mnt = real_mount(path->mnt);
+		if (mnt && mnt->mnt_devname && !strcmp(mnt->mnt_devname, "KSU")) {
+			return true;
+		}
+	}
+	return false;
+}
+#endif
+"""
+
+
+def fix_namespace():
+    p = "fs/namespace.c"
+    s = rd(p)
+    notes = []
+    if "susfs_mnt_id_ida" not in s:
+        m = re.search(r'^#include "pnode.h"\n', s, re.M)
+        if not m:
+            return fail(p, '#include "pnode.h" tidak ketemu')
+        s = s[:m.start()] + NS_TOP_INC + s[m.start():]
+        m = re.search(r'^#include "internal.h"\n', s, re.M)
+        if not m:
+            return fail(p, '#include "internal.h" tidak ketemu')
+        s = s[:m.end()] + NS_TOP_DECL + s[m.end():]
+        notes.append("blok atas")
+    if not re.search(r'void susfs_run_try_umount_for_current_mnt_ns\(', s):
+        s = s.rstrip("\n") + "\n" + NS_BOTTOM_UMOUNT
+        notes.append("try_umount")
+    if not re.search(r'bool susfs_is_mnt_devname_ksu\(struct path', s):
+        s = s.rstrip("\n") + "\n" + NS_BOTTOM_DEVNAME
+        notes.append("devname_ksu")
+    wr(p, s)
+    rm_rej(p)
+    if notes:
+        ok(p, "ditambah: " + ", ".join(notes))
+    else:
+        skip(p, "semua sudah ada")
+
+
+# --------------------------------------------------------------- fdinfo.c
+def fix_fdinfo():
+    p = "fs/notify/fdinfo.c"
+    if os.path.exists(os.path.join(root, p + ".rej")):
+        rm_rej(p)
+        skip(p, "hook sembunyikan inotify fdinfo dilewati (tidak kritikal, pola 4.14 beda)")
+
+
+for fn in (fix_namei, fix_task_mmu, fix_cmdline, fix_readdir, fix_namespace, fix_fdinfo):
+    try:
+        fn()
+    except Exception as e:
+        fail(fn.__name__, "exception: %r" % (e,))
+
+print("\n".join(log))
+sys.exit(1 if bad else 0)
+PYEOF
 
     find . -name '*.rej' -not -path './out/*' > /tmp/rej.list
     if [ -s /tmp/rej.list ]; then
@@ -131,9 +382,9 @@ scripts/config --file "$CFG" \
     -e KSU \
     -d KSU_TRACEPOINT_HOOK \
     -e KSU_MANUAL_HOOK \
-    -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
-    -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
-    -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+    -d KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+    -d KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+    -d KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
     -e KALLSYMS_ALL
 
 # ---- Nama kernel ----
@@ -145,13 +396,12 @@ echo "[+] LOCALVERSION: $LV"
 
 if [ "$ENABLE_SUSFS" = "1" ]; then
     echo "[+] Mengaktifkan SuSFS (fitur inti saja)..."
-    # AKTIF  : SUS_PATH, SUS_MOUNT, TRY_UMOUNT
+    # AKTIF  : SUS_PATH, TRY_UMOUNT (+ SUS_MOUNT kalau SUSFS_SUS_MOUNT=1)
     # NONAKTIF sengaja: SUS_SU (tidak didukung non-GKI), ENABLE_LOG, OPEN_REDIRECT, SUS_MAP, SUS_KSTAT, SPOOF_*
     #                   dan opsi *REORDER* (bikin bootloop di non-GKI)
     scripts/config --file "$CFG" \
         -e KSU_SUSFS \
         -e KSU_SUSFS_SUS_PATH \
-        -e KSU_SUSFS_SUS_MOUNT \
         -e KSU_SUSFS_TRY_UMOUNT \
         -d KSU_SUSFS_SUS_SU \
         -d KSU_SUSFS_ENABLE_LOG \
@@ -160,6 +410,13 @@ if [ "$ENABLE_SUSFS" = "1" ]; then
         -d KSU_SUSFS_SUS_KSTAT \
         -d KSU_SUSFS_SPOOF_UNAME \
         -d KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+
+    # SUS_MOUNT di patch ini membawa logika reorder mnt_id (dilaporkan bikin bootloop di non-GKI)
+    if [ "$SUSFS_SUS_MOUNT" = "1" ]; then
+        scripts/config --file "$CFG" -e KSU_SUSFS_SUS_MOUNT
+    else
+        scripts/config --file "$CFG" -d KSU_SUSFS_SUS_MOUNT
+    fi
 fi
 
 make -C $KERNEL_ROOT O=$KERNEL_ROOT/out ARCH=$ARCH CC=$CC LD=ld.lld olddefconfig
@@ -191,7 +448,9 @@ if [ "$ENABLE_SUSFS" = "1" ]; then
         grep -n "KSU_SUSFS\|KSU_MANUAL_HOOK" "$CFG" || echo "(tidak ada)"
         exit 1
     fi
-    for s in KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_TRY_UMOUNT; do
+    CHK="KSU_SUSFS_SUS_PATH KSU_SUSFS_TRY_UMOUNT"
+    [ "$SUSFS_SUS_MOUNT" = "1" ] && CHK="$CHK KSU_SUSFS_SUS_MOUNT"
+    for s in $CHK; do
         grep -q "^CONFIG_${s}=y" "$CFG" && echo "    [ok] $s" || echo "    [--] $s tidak aktif (simbol mungkin beda nama/versi)"
     done
     if grep -q '^CONFIG_KSU_SUSFS_SUS_SU=y' "$CFG"; then
