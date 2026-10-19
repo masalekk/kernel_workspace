@@ -14,15 +14,16 @@ export BSP_BUILD_FAMILY=sharkl3
 export BSP_BUILD_ANDROID_OS=y
 export DEFCONFIG="a3core_eur_open_defconfig"
 
-# ---- Opsi SuSFS ----
-ENABLE_SUSFS=1                                   # 0 = build tanpa SuSFS (versi yang sudah terbukti jalan)
+# ---- Opsi ----
+ENABLE_SUSFS=1                                   # 0 = build tanpa SuSFS
 SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
 SUSFS_BRANCH="kernel-4.14"
+LOCALVERSION_BASE="-Perf-v2s-BakaSU"             # nama kernel (uname -r), -SUSFS dan -@masalek ditambah otomatis
 
 # ==========================================
-# TAHAP 1: KSU Integration
+# TAHAP 1: KSU Integration (BakaSU/ReSukiSU)
 # ==========================================
-echo "[+] Mengintegrasikan ReSukiSU/BakaSU..."
+echo "[+] Mengintegrasikan BakaSU/ReSukiSU..."
 cd "$KERNEL_ROOT"
 
 rm -rf "$KERNEL_ROOT/KernelSU"
@@ -124,21 +125,29 @@ CFG="$KERNEL_ROOT/out/.config"
 echo "[+] Melakukan konfigurasi kernel dengan $DEFCONFIG..."
 make -C $KERNEL_ROOT O=$KERNEL_ROOT/out ARCH=$ARCH CC=$CC LD=ld.lld $DEFCONFIG
 
+# ---- BakaSU: MANUAL HOOK saja (tanpa opsi AUTO_*; setuid/read/input sudah manual di source) ----
 echo "[+] Mengaktifkan BakaSU manual hook..."
 scripts/config --file "$CFG" \
     -e KSU \
     -d KSU_TRACEPOINT_HOOK \
     -e KSU_MANUAL_HOOK \
-    -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
-    -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
-    -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+    -d KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+    -d KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+    -d KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
     -e KALLSYMS_ALL
+
+# ---- Nama kernel ----
+LV="$LOCALVERSION_BASE"
+[ "$ENABLE_SUSFS" = "1" ] && LV="$LV-SUSFS"
+LV="$LV-@masalek"
+scripts/config --file "$CFG" --set-str LOCALVERSION "$LV" -d LOCALVERSION_AUTO
+echo "[+] LOCALVERSION: $LV"
 
 if [ "$ENABLE_SUSFS" = "1" ]; then
     echo "[+] Mengaktifkan SuSFS (fitur inti saja)..."
-    # AKTIF  : SUS_PATH (sembunyikan path), SUS_MOUNT (sembunyikan mount), TRY_UMOUNT (umount module utk app tertentu)
+    # AKTIF  : SUS_PATH, SUS_MOUNT, TRY_UMOUNT
     # NONAKTIF sengaja: SUS_SU (tidak didukung non-GKI), ENABLE_LOG, OPEN_REDIRECT, SUS_MAP, SUS_KSTAT, SPOOF_*
-    #                   dan apa pun yang berbau mnt_id reorder (bikin bootloop di non-GKI)
+    #                   dan opsi *REORDER* (bikin bootloop di non-GKI)
     scripts/config --file "$CFG" \
         -e KSU_SUSFS \
         -e KSU_SUSFS_SUS_PATH \
@@ -164,6 +173,11 @@ make -C $KERNEL_ROOT O=$KERNEL_ROOT/out ARCH=$ARCH CC=$CC LD=ld.lld olddefconfig
 
 echo "[+] Config KSU aktif:"
 grep -i "CONFIG_KSU" "$CFG" || echo "[!] CONFIG_KSU tidak ada di .config"
+
+if ! grep -q '^CONFIG_KSU_MANUAL_HOOK=y' "$CFG"; then
+    echo "[!] CONFIG_KSU_MANUAL_HOOK tidak aktif setelah olddefconfig, hentikan."
+    exit 1
+fi
 
 if [ "$ENABLE_SUSFS" = "1" ]; then
     echo "[+] Verifikasi SuSFS..."
